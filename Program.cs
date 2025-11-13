@@ -1,158 +1,242 @@
 using System;
 using System.Collections.Generic;
-using System.Drawing; // Основний простір імен для графіки
-using System.Drawing.Drawing2D; // Для згладжування ліній
-using System.Windows.Forms;
+using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Linq;
+using System.Windows.Forms;
 
 namespace GraphDrawingLab
 {
-    // Головний клас форми
-    public class GraphForm : Form
+    // --- 1. MODEL (Дані та Математика) ---
+    // Цей клас нічого не знає про форму чи Graphics. Тільки чиста логіка.
+    public class GraphModel
     {
-        // Структура для зберігання точок графіка
-        private struct GraphPoint
+        public struct DataPoint
         {
-            public double T { get; set; } // Координата X (час t)
-            public double Y { get; set; } // Координата Y (значення функції)
+            public double T { get; }
+            public double Y { get; }
+            public DataPoint(double t, double y) { T = t; Y = y; }
         }
 
-        private List<GraphPoint> _points;
-        private const double T_START = 2.3;
-        private const double T_END = 7.2;
-        private const double T_STEP = 0.8;
+        public List<DataPoint> Points { get; private set; }
+        
+        // Використовуємо PascalCase для констант (Code Convention)
+        private const double TStart = 2.3;
+        private const double TEnd = 7.2;
+        private const double TStep = 0.8;
 
-        public GraphForm()
+        public GraphModel()
         {
-            // Налаштування вікна
-            this.Text = "Лабораторна: Графік System.Drawing";
-            this.Size = new Size(800, 600);
-            this.MinimumSize = new Size(400, 300);
-            
-            // Вмикаємо подвійну буферизацію, щоб графік не мерехтів при ресайзі
-            this.DoubleBuffered = true;
-            this.ResizeRedraw = true; // Автоматично викликає перерисовку при зміні розміру
-
             CalculateData();
         }
 
-        /// <summary>
-        /// Обчислення таблиці значень функції
-        /// </summary>
         private void CalculateData()
         {
-            _points = new List<GraphPoint>();
-
-            // Цикл згідно з завданням: від 2.3 до 7.2 з кроком 0.8
-            for (double t = T_START; t <= T_END; t += T_STEP)
+            Points = new List<DataPoint>();
+            for (double t = TStart; t <= TEnd; t += TStep)
             {
-                // Формула: y = (cos^3(t^2)) / (1.5t + 2)
+                // y = (cos^3(t^2)) / (1.5t + 2)
                 double numerator = Math.Pow(Math.Cos(t * t), 3);
                 double denominator = (1.5 * t) + 2.0;
-                
-                double y = numerator / denominator;
 
-                _points.Add(new GraphPoint { T = t, Y = y });
+                // Захист від ділення на нуль у самій формулі (хоча за умовою t >= 2.3, це не станеться)
+                if (Math.Abs(denominator) < 1e-9) denominator = 1e-9;
+
+                double y = numerator / denominator;
+                Points.Add(new DataPoint(t, y));
             }
         }
 
-        /// <summary>
-        /// Основний метод для малювання (перевизначення методу базового класу)
-        /// </summary>
-        protected override void OnPaint(PaintEventArgs e)
+        public (double MinT, double MaxT, double MinY, double MaxY) GetBounds()
         {
-            base.OnPaint(e);
-            
-            // Отримуємо об'єкт графіки
-            Graphics g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias; // Увімкнути згладжування
+            if (Points == null || Points.Count == 0) return (0, 0, 0, 0);
+            return (Points.Min(p => p.T), Points.Max(p => p.T), 
+                    Points.Min(p => p.Y), Points.Max(p => p.Y));
+        }
+    }
 
-            // Якщо точок немає або їх замало - не малюємо
-            if (_points == null || _points.Count < 2) return;
+    // --- 2. RENDERER (Логіка малювання) ---
+    // Відповідає за перетворення координат і малювання. Реалізує IDisposable для очищення GDI ресурсів.
+    public class GraphRenderer : IDisposable
+    {
+        private readonly Font _mainFont;
+        private readonly Pen _axisPen;
+        private readonly Pen _graphPen;
+        private readonly Brush _pointBrush;
+        private readonly Brush _textBrush;
 
-            // 1. Визначаємо межі (Min/Max) для масштабування
-            double minT = _points.Min(p => p.T);
-            double maxT = _points.Max(p => p.T);
-            double minY = _points.Min(p => p.Y);
-            double maxY = _points.Max(p => p.Y);
+        public bool ShowLabels { get; set; } = true;
+        public bool IsScatterPlot { get; set; } = false; // Line vs Scatter
 
-            // Додамо невеликі відступи, щоб графік не прилипав до країв форми
-            float padding = 50f;
-            float drawWidth = this.ClientSize.Width - 2 * padding;
-            float drawHeight = this.ClientSize.Height - 2 * padding;
+        public GraphRenderer()
+        {
+            // Ініціалізація ресурсів ОДИН РАЗ
+            _mainFont = new Font("Segoe UI", 8);
+            _axisPen = new Pen(Color.Gray, 1) { DashStyle = DashStyle.Dash };
+            _graphPen = new Pen(Color.RoyalBlue, 2);
+            _pointBrush = new SolidBrush(Color.Crimson);
+            _textBrush = new SolidBrush(Color.Black);
+        }
 
-            // 2. Функції перетворення координат (Математика -> Пікселі)
-            // X: (t - minT) / (maxT - minT) * ширина
-            // Y: (y - minY) / (maxY - minY) * висота. 
-            // УВАГА: У комп'ютерній графіці вісь Y йде ВНИЗ. Тому Y треба інвертувати.
+        public void Draw(Graphics g, RectangleF drawArea, GraphModel model)
+        {
+            if (model.Points.Count < 2) return;
 
-            float GetScreenX(double t)
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            // 1. Отримуємо межі даних
+            var bounds = model.GetBounds();
+            double rangeT = bounds.MaxT - bounds.MinT;
+            double rangeY = bounds.MaxY - bounds.MinY;
+
+            // ЗАХИСТ: Перевірка на нульовий діапазон (ділення на нуль)
+            if (Math.Abs(rangeT) < 1e-9) rangeT = 1.0; 
+            if (Math.Abs(rangeY) < 1e-9) rangeY = 1.0;
+
+            // 2. Функції конвертації (World -> Screen)
+            float GetScreenX(double t) =>
+                drawArea.Left + (float)((t - bounds.MinT) / rangeT * drawArea.Width);
+
+            float GetScreenY(double y) =>
+                drawArea.Bottom - (float)((y - bounds.MinY) / rangeY * drawArea.Height);
+
+            // 3. Малюємо рамку
+            g.DrawRectangle(_axisPen, drawArea.X, drawArea.Y, drawArea.Width, drawArea.Height);
+
+            // 4. Підготовка точок для швидкого малювання
+            PointF[] screenPoints = model.Points
+                .Select(p => new PointF(GetScreenX(p.T), GetScreenY(p.Y)))
+                .ToArray();
+
+            // 5. Малювання графіка
+            if (!IsScatterPlot)
             {
-                return padding + (float)((t - minT) / (maxT - minT) * drawWidth);
+                // ОПТИМІЗАЦІЯ: DrawLines набагато швидше за цикл DrawLine
+                g.DrawLines(_graphPen, screenPoints);
             }
 
-            float GetScreenY(double y)
-            {
-                // Інвертуємо Y: віднімаємо нормоване значення від нижньої межі області малювання
-                return (this.ClientSize.Height - padding) - (float)((y - minY) / (maxY - minY) * drawHeight);
-            }
+            // 6. Малювання точок та підписів (якщо потрібно)
+            float pointRadius = IsScatterPlot ? 4 : 2.5f;
 
-            // 3. Малювання осей (спрощено, просто рамка області графіка)
-            using (Pen axisPen = new Pen(Color.Gray, 1) { DashStyle = DashStyle.Dash })
+            for (int i = 0; i < screenPoints.Length; i++)
             {
-                g.DrawRectangle(axisPen, padding, padding, drawWidth, drawHeight);
-            }
+                float x = screenPoints[i].X;
+                float y = screenPoints[i].Y;
 
-            // 4. Малювання самого графіка та точок
-            using (Pen graphPen = new Pen(Color.Blue, 2))
-            using (Brush pointBrush = new SolidBrush(Color.Red))
-            using (Font font = new Font("Arial", 8))
-            using (Brush textBrush = new SolidBrush(Color.Black))
-            {
-                for (int i = 0; i < _points.Count - 1; i++)
+                // Малюємо точку
+                g.FillEllipse(_pointBrush, x - pointRadius, y - pointRadius, pointRadius * 2, pointRadius * 2);
+
+                // Малюємо текст (опціонально, щоб не засмічувати графік)
+                if (ShowLabels)
                 {
-                    // Поточна точка
-                    float x1 = GetScreenX(_points[i].T);
-                    float y1 = GetScreenY(_points[i].Y);
-
-                    // Наступна точка
-                    float x2 = GetScreenX(_points[i+1].T);
-                    float y2 = GetScreenY(_points[i+1].Y);
-
-                    // Малюємо лінію між точками
-                    g.DrawLine(graphPen, x1, y1, x2, y2);
-
-                    // Малюємо кружечок на точці (щоб було видно крок 0.8)
-                    float r = 3; // радіус точки
-                    g.FillEllipse(pointBrush, x1 - r, y1 - r, 2 * r, 2 * r);
-                    
-                    // Підписуємо координати (опціонально)
-                    string label = $"({_points[i].T:F1}; {_points[i].Y:F3})";
-                    g.DrawString(label, font, textBrush, x1, y1 - 20);
+                    // Пропускаємо деякі підписи, якщо точок дуже багато, або малюємо всі, якщо їх мало (як у завданні)
+                    string label = $"({model.Points[i].T:F1}; {model.Points[i].Y:F3})";
+                    // Зсув тексту, щоб не перекривав точку
+                    g.DrawString(label, _mainFont, _textBrush, x + 3, y - 15);
                 }
-
-                // Малюємо останню точку окремо (бо цикл йде до передостанньої)
-                var lastPoint = _points.Last();
-                float xL = GetScreenX(lastPoint.T);
-                float yL = GetScreenY(lastPoint.Y);
-                g.FillEllipse(pointBrush, xL - 3, yL - 3, 6, 6);
-                g.DrawString($"({lastPoint.T:F1}; {lastPoint.Y:F3})", font, textBrush, xL, yL - 20);
             }
             
             // Заголовок
-            g.DrawString("Графік функції y = (cos^3(t^2)) / (1.5t + 2)", 
-                         new Font("Arial", 14, FontStyle.Bold), 
-                         Brushes.DarkSlateGray, 
-                         padding, 10);
+            g.DrawString("y = cos^3(t^2) / (1.5t + 2)", new Font(_mainFont.FontFamily, 12, FontStyle.Bold), Brushes.DarkSlateGray, drawArea.Left, drawArea.Top - 25);
         }
 
-        // Точка входу в програму
+        public void Dispose()
+        {
+            _mainFont?.Dispose();
+            _axisPen?.Dispose();
+            _graphPen?.Dispose();
+            _pointBrush?.Dispose();
+            _textBrush?.Dispose();
+        }
+    }
+
+    // --- 3. FORM (UI & Controller) ---
+    public class MainForm : Form
+    {
+        private readonly GraphModel _model;
+        private readonly GraphRenderer _renderer;
+        
+        // UI Controls
+        private Panel _controlsPanel;
+        private CheckBox _chkShowLabels;
+        private RadioButton _rbLine;
+        private RadioButton _rbScatter;
+
+        public MainForm()
+        {
+            // Налаштування форми
+            this.Text = "Лабораторна: System.Drawing (Refactored)";
+            this.Size = new Size(900, 600);
+            this.MinimumSize = new Size(500, 400);
+            
+            // Уникнення миготіння
+            this.DoubleBuffered = true;
+            this.ResizeRedraw = true;
+
+            // Ініціалізація компонентів
+            _model = new GraphModel();
+            _renderer = new GraphRenderer();
+
+            InitializeCustomControls();
+        }
+
+        private void InitializeCustomControls()
+        {
+            _controlsPanel = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 40,
+                Padding = new Padding(10),
+                BackColor = Color.WhiteSmoke
+            };
+
+            _rbLine = new RadioButton { Text = "Лінійний графік", Checked = true, AutoSize = true, Location = new Point(10, 10) };
+            _rbScatter = new RadioButton { Text = "Точковий (Scatter)", AutoSize = true, Location = new Point(130, 10) };
+            _chkShowLabels = new CheckBox { Text = "Показувати координати", Checked = true, AutoSize = true, Location = new Point(270, 10) };
+
+            // Підписка на події
+            _rbLine.CheckedChanged += (s, e) => { _renderer.IsScatterPlot = !_rbLine.Checked; this.Invalidate(); };
+            _chkShowLabels.CheckedChanged += (s, e) => { _renderer.ShowLabels = _chkShowLabels.Checked; this.Invalidate(); };
+
+            _controlsPanel.Controls.Add(_rbLine);
+            _controlsPanel.Controls.Add(_rbScatter);
+            _controlsPanel.Controls.Add(_chkShowLabels);
+            this.Controls.Add(_controlsPanel);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+
+            // Відступ для області малювання (враховуючи панель керування)
+            float padding = 40f;
+            RectangleF drawRect = new RectangleF(
+                padding, 
+                _controlsPanel.Height + padding, // Зсув вниз через панель
+                this.ClientSize.Width - 2 * padding, 
+                this.ClientSize.Height - _controlsPanel.Height - 2 * padding
+            );
+
+            // Перевірка на коректність розмірів вікна (захист від мінусової ширини/висоти)
+            if (drawRect.Width <= 0 || drawRect.Height <= 0) return;
+
+            // Делегуємо малювання рендереру
+            _renderer.Draw(e.Graphics, drawRect, _model);
+        }
+
+        // Важливо: очищення ресурсів при закритті форми
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            _renderer.Dispose();
+            base.OnFormClosing(e);
+        }
+
         [STAThread]
         static void Main()
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new GraphForm());
+            Application.Run(new MainForm());
         }
     }
 }
